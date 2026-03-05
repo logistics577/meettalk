@@ -15,6 +15,15 @@ from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 import json, uuid, hashlib, os, base64, hmac as _hmac
 import socketio
+import os
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+
+
+
 
 # ── Socket.IO setup ────────────────────────────────────────────────────────────
 sio = socketio.AsyncServer(
@@ -38,7 +47,8 @@ fastapi_app.add_middleware(
 app = socketio.ASGIApp(sio, other_asgi_app=fastapi_app)
 
 # ── DB ─────────────────────────────────────────────────────────────────────────
-MONGO_URL  = os.getenv("MONGO_URL", "mongodb+srv://zapierobroy_db_user:JkkZxi5rySFcqhds@cluster0.ncgeqd2.mongodb.net/")
+MONGO_URL  = os.getenv("MONGO_URL")
+print(MONGO_URL)
 SECRET_KEY = "voicelink-stable-secret-2024".encode()
 
 db             = AsyncIOMotorClient(MONGO_URL)["voicelink_v5"]
