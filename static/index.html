@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
 <title>VoiceLink</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
 <style>
 :root{
   --bg:#0b0d12;--s1:#111318;--s2:#181c24;--s3:#1f2430;
@@ -761,22 +762,21 @@ html,body{width:100%;height:100%;font-family:'Manrope',sans-serif;background:var
 
 <script>
 'use strict';
-const SRV    = window.location.origin;
-const WSBASE = (location.protocol==='https:'?'wss:':'ws:')+'//'+location.host;
-const SKEY   = 'vl7';
-const TTL    = 7*24*3600*1000;
+const SRV  = window.location.origin;
+const SKEY = 'vl7';
+const TTL  = 7*24*3600*1000;
 
-let ME=null,ws=null,activeChat=null;
-let pc=null,pcs={};  // for group: pcs[uid]=RTCPeerConnection
+let ME=null, socket=null, activeChat=null;
+let pc=null, pcs={};
 let localStream=null;
-let callId=null,callerId=null,callType='audio';
-let isGroupCall=false,groupCallId=null,groupMembers=[];
-let callSec=0,callTimer=null,isMuted=false,isCamOff=false,isInCall=false,callMinimized=false;
+let callId=null, callerId=null, callType='audio';
+let isGroupCall=false, groupCallId=null, groupMembers=[];
+let callSec=0, callTimer=null, isMuted=false, isCamOff=false, isInCall=false, callMinimized=false;
 let users=[];
-let vrec=null,vchunks=[],vrecording=false;
-let joinTime=null;  // for recording timestamps
-let typingTimer=null,lastTypingSent=false;
-let pendingPrivacy={from_id:null,from_name:null,preview:null};
+let vrec=null, vchunks=[], vrecording=false;
+let joinTime=null;
+let typingTimer=null, lastTypingSent=false;
+let pendingPrivacy={from_id:null, from_name:null, preview:null};
 const STUN={iceServers:[{urls:'stun:stun.l.google.com:19302'},{urls:'stun:stun1.l.google.com:19302'}]};
 
 // ── Session ──────────────────────────────────────────────────────────────────
@@ -794,7 +794,7 @@ function showSplash(){G('splash').style.display='flex';G('splash').classList.rem
 
 // ── Register ─────────────────────────────────────────────────────────────────
 async function doRegister(){
-  const name=G('regName').value.trim(),email=G('regEmail').value.trim();
+  const name=G('regName').value.trim(), email=G('regEmail').value.trim();
   if(!name||!email){shk();return;}
   const btn=G('regBtn');btn.textContent='Connecting…';btn.disabled=true;
   try{
@@ -824,7 +824,8 @@ function bootApp(user,token,anim){
   G('app').classList.add('on');
   const av=G('myAv');av.textContent=ini(ME.name);av.style.background=ME.avatar_color||rcolor(ME.name);
   G('myName').textContent=ME.name;
-  connectWS(token);loadChats();loadLog();
+  connectSIO(token);
+  loadChats();loadLog();
   if(token&&!token.startsWith('demo_')){
     fetch(SRV+'/api/me',{credentials:'include',headers:{'X-Session':token},signal:AbortSignal.timeout(5000)})
       .then(r=>r.ok?r.json():null).then(d=>{if(d?.user)saveSess(d.user,token);}).catch(()=>{});
@@ -832,33 +833,36 @@ function bootApp(user,token,anim){
 }
 
 function doLogout(){
-  clearSess();fetch(`${SRV}/api/logout`,{method:'POST',credentials:'include'}).catch(()=>{});
-  if(ws)ws.close();ME=null;activeChat=null;
+  clearSess();
+  fetch(`${SRV}/api/logout`,{method:'POST',credentials:'include'}).catch(()=>{});
+  if(socket){socket.disconnect();socket=null;}
+  ME=null;activeChat=null;
   G('app').classList.remove('on');showSplash();
 }
 
-// ── WebSocket ─────────────────────────────────────────────────────────────────
-let _wsToken='',_wsRetry=0;
-function connectWS(token){if(!ME)return;_wsToken=token||loadSess()?.token||'';_doWS();}
-function _doWS(){
+// ── Socket.IO ────────────────────────────────────────────────────────────────
+function connectSIO(token){
   if(!ME)return;
-  const rt=_wsToken&&!_wsToken.startsWith('demo_')?_wsToken:'';
-  const url=rt?`${WSBASE}/ws/${ME.user_id}?token=${encodeURIComponent(rt)}`:`${WSBASE}/ws/${ME.user_id}`;
-  ws=new WebSocket(url);
-  ws.onopen=()=>{_wsRetry=0;loadUsers();};
-  ws.onmessage=e=>{
-    const d=JSON.parse(e.data);
-    if(d.type==='error'&&d.info){
-      const info=d.info.toLowerCase();
-      if(info.includes('token')||info.includes('mismatch')){_wsToken='';setTimeout(_doWS,600);return;}
-      if(info.includes('not found')){notif('🔑','Session Expired','Please sign in again','amb');return;}
-    }
-    onWS(d);
-  };
-  ws.onclose=()=>{_wsRetry++;setTimeout(_doWS,Math.min(1000*_wsRetry,8000));};
-  ws.onerror=()=>loadUsers(true);
+  // Socket.IO handles reconnection automatically — no manual retry needed
+  socket=io(SRV,{
+    auth:{user_id:ME.user_id, token:token||''},
+    transports:['websocket','polling']
+  });
+  // Route every event into the same onWS handler by re-wrapping as {type, ...data}
+  socket.onAny((event, data)=>{
+    onWS({type:event, ...(data||{})});
+  });
+  socket.on('connect',()=>{
+    loadUsers();
+  });
 }
-function wss(d){if(ws&&ws.readyState===1)ws.send(JSON.stringify(d));}
+
+// Replaces wss() — emits event name as Socket.IO event, rest of object as data
+function wss(d){
+  if(!socket||!socket.connected)return;
+  const {type, ...rest}=d;
+  socket.emit(type, rest);
+}
 
 // ── WS Handler ────────────────────────────────────────────────────────────────
 function onWS(m){
@@ -870,14 +874,11 @@ function onWS(m){
     case 'user_busy':     updOnl(m.user_id,null,true);break;
     case 'user_free':     updOnl(m.user_id,null,false);break;
     case 'chat_message':
-      // Only render bubble if this chat is currently open
       if(activeChat?.user_id===m.sender_id){
         addBubble(m,false);
-        // We're looking at this chat — send read receipt immediately
         wss({type:'mark_read',other_id:m.sender_id});
         wss({type:'messages_read',to_id:m.sender_id});
       } else {
-        // Different chat — update badge & notification only, DON'T render bubble
         updChatBadge(1);
         if(isInCall) showCallMsgPopup(m);
         else notif('💬',m.sender_name,prevMsg(m),'blu');
@@ -885,7 +886,6 @@ function onWS(m){
       loadChats();
       break;
     case 'message_sent':
-      // Only render our sent message if the chat it belongs to is currently open
       if(activeChat?.user_id===m.receiver_id){
         addBubble(m,true);
       }
@@ -901,16 +901,14 @@ function onWS(m){
     case 'typing':         showTyping(m.from_id,m.from_name,m.is_typing);break;
     case 'incoming_call':
       if(isInCall){
-        // Already in call — auto-reject and send busy back
         wss({type:'call_rejected',call_id:m.call_id,caller_id:m.caller_id});
         break;
       }
       callId=m.call_id;callerId=m.caller_id;callType=m.call_type||'audio';
       isGroupCall=false;showInc(m.caller_name,m.avatar_color,m.caller_id,callType);ring();break;
-    case 'call_ringing':  callType=m.call_type||'audio';break; // already showing ringing screen
+    case 'call_ringing':  callType=m.call_type||'audio';break;
     case 'call_accepted': stopRing();showCallScr('connecting',m.callee_name,m.call_id);startOffer(m.callee_id);break;
     case 'call_rejected': stopRing();isInCall=false;cleanCall();
-      // If callee was busy, show busy screen; otherwise show declined
       if(m.busy) showBusyScreen('them', activeChat?.name||'?');
       else showDeclinedScreen(m.by_name||activeChat?.name||'?');
       loadLog();break;
@@ -1075,7 +1073,6 @@ async function openChat(uid,name,color){
   }catch{}
   wss({type:'mark_read',other_id:uid});
   wss({type:'messages_read',to_id:uid});
-  // Clear unread count for this conversation in the sidebar immediately
   clearConvUnread(uid);
   if(window.innerWidth>680)G('msgTxt').focus();
 }
@@ -1099,7 +1096,6 @@ function fmtDate(iso){
 // ── Bubbles ───────────────────────────────────────────────────────────────────
 function msgBelongsToActiveChat(m){
   if(!activeChat||!ME)return false;
-  // The message must be between ME and the currently open chat user
   const myId=ME.user_id;
   const otherId=activeChat.user_id;
   return(
@@ -1109,7 +1105,6 @@ function msgBelongsToActiveChat(m){
 }
 
 function addBubble(m,isOut,scroll=true){
-  // STRICT: only render if this message belongs to the currently open conversation
   if(!activeChat||!ME)return;
   if(!msgBelongsToActiveChat(m))return;
 
@@ -1121,10 +1116,6 @@ function addBubble(m,isOut,scroll=true){
   const ts=new Date(m.timestamp);
   const timeStr=isNaN(ts)?'':(ts.toLocaleTimeString(navigator.language,{hour:'2-digit',minute:'2-digit'}));
 
-  // Tick logic:
-  // read=true           → ✓✓ blue   (seen)
-  // read=false, isOut   → ✓  grey   (sent, not yet seen)
-  // When receiver opens chat, markConvAsRead will flip ✓ → ✓✓ blue live
   function tickHTML(read){
     if(!isOut)return'';
     if(read)return` <span class="tick tick-read">✓✓</span>`;
@@ -1158,7 +1149,6 @@ function addBubble(m,isOut,scroll=true){
 }
 
 function markMsgPending(msgId){
-  // Show sending indicator - message will be delivered after acceptance
   notif('⏳','Pending','Message sent — waiting for recipient to accept','amb');
 }
 
@@ -1181,25 +1171,20 @@ function applyDelete(msgId){
 }
 
 // ── Read Receipts ─────────────────────────────────────────────────────────────
-// Called when the OTHER user reads our messages — flip all ticks to ✓✓ blue
 function markConvAsRead(fromId){
   if(!activeChat||activeChat.user_id!==fromId)return;
   document.querySelectorAll('.bubble.out .tick').forEach(el=>{
     el.className='tick tick-read';
-    el.textContent='✓✓'; // upgrade single ✓ to double ✓✓ blue
+    el.textContent='✓✓';
   });
 }
 
-// Called when WE open a chat — clear the unread badge in sidebar immediately
 function clearConvUnread(uid){
-  // Find the chat item in sidebar and remove unread badge
   const items=G('chatList').querySelectorAll('.itm');
   items.forEach(item=>{
-    // Match by onclick uid
     if(item.getAttribute('onclick')?.includes(uid)){
       const badge=item.querySelector('.ibdg');
       if(badge){
-        // Subtract from total
         const count=parseInt(badge.textContent)||0;
         totalUnread=Math.max(0,totalUnread-count);
         badge.remove();
@@ -1230,12 +1215,10 @@ function showCallMsgPopup(m){
   else txt=m.text||'';
   G('cmpText').textContent=txt;
 
-  // Reset and restart progress bar animation
   const bar=G('cmpBar');
   bar.style.animation='none';
   popup.classList.remove('hide');
   popup.classList.add('show');
-  // Force reflow to restart animation
   void bar.offsetWidth;
   bar.style.animation='cmpBar 4s linear forwards';
 
@@ -1247,10 +1230,8 @@ function showCallMsgPopup(m){
 
 function replyFromCall(){
   if(!callMsgPendingReply)return;
-  // Minimize call, open the chat
   minimizeCall();
   openChatM(callMsgPendingReply.uid,callMsgPendingReply.name,callMsgPendingReply.color);
-  // Hide popup
   clearTimeout(callMsgHideTimer);
   const popup=G('callMsgPopup');
   popup.classList.remove('show','hide');
@@ -1271,7 +1252,6 @@ function showCtx(e,m,isOut){
     item.innerHTML='🗑️ Delete message';item.onclick=()=>{deleteMsg(m.message_id);menu.style.display='none';};
     menu.appendChild(item);
   }
-  // Copy text
   if(m.msg_type==='text'&&m.text){
     const item=document.createElement('div');item.className='ctx-item';
     item.innerHTML='📋 Copy text';item.onclick=()=>{navigator.clipboard?.writeText(m.text);notif('📋','Copied','Text copied','grn');menu.style.display='none';};
@@ -1426,7 +1406,6 @@ function startGroupCall(){
   isInCall=true;
 }
 function showGroupIncoming(m){
-  // Show as incoming call with group badge
   callId=m.call_id;callerId=m.host_id;callType=m.call_type||'audio';
   isGroupCall=true;
   G('incTypeBadge').textContent=`👥 Group ${callType==='video'?'Video':'Audio'} Call · ${m.participant_count} people`;
@@ -1475,7 +1454,6 @@ async function doGroupOffer(sdp,fromId){
   wss({type:'webrtc_answer',target_id:fromId,sdp:ans,call_id:groupCallId});
 }
 function attachGroupAudio(uid,stream){
-  // For audio, create hidden audio element. For video, attach to grpcell
   if(callType==='video'){
     const cell=G('grpcell_'+uid);
     if(cell){const v=document.createElement('video');v.srcObject=stream;v.autoplay=true;v.playsinline=true;v.style.cssText='position:absolute;inset:0;width:100%;height:100%;object-fit:cover;';cell.appendChild(v);}
@@ -1488,16 +1466,13 @@ function attachGroupAudio(uid,stream){
 function dial(t){if(activeChat)callTo(activeChat.user_id,activeChat.name,activeChat.avatar_color,t);}
 function callTo(uid,name,color,type='audio'){
   if(isInCall){showBusyScreen('you');return;}
-  // Check if target user is marked busy in our local users list
   const targetUser=users.find(u=>u.user_id===uid);
   if(targetUser?.busy){showBusyScreen('them',name);return;}
   if(!activeChat||activeChat.user_id!==uid)activeChat={user_id:uid,name,avatar_color:color||rcolor(name)};
-  // Don't set isInCall=true yet — wait for server confirmation (call_ringing)
-  // But do show the ringing screen optimistically
   callType=type;isGroupCall=false;
   wss({type:'call_request',callee_id:uid,call_type:type});
   showCallScr('ringing',name,null);
-  isInCall=true; // set after sending so double-taps are blocked
+  isInCall=true;
 }
 function acceptCall(){
   G('incOv').classList.remove('on');stopRing();isInCall=true;
@@ -1513,7 +1488,7 @@ function acceptCall(){
 }
 function rejectCall(){
   G('incOv').classList.remove('on');stopRing();
-  isInCall=false; // reset — we're not accepting this call
+  isInCall=false;
   if(isGroupCall){wss({type:'group_call_reject',call_id:callId,host_id:callerId});}
   else{wss({type:'call_rejected',call_id:callId,caller_id:callerId});}
   callId=null;callerId=null;isGroupCall=false;
@@ -1521,8 +1496,7 @@ function rejectCall(){
 function endCall(){
   if(isGroupCall){wss({type:'group_call_leave',call_id:groupCallId||callId});}
   else{wss({type:'call_ended',call_id:callId,other_id:activeChat?.user_id||callerId,duration:callSec});}
-  // saveRecording captures callId internally BEFORE cleanCall resets it
-  saveRecording(); // async, runs in background — callId captured inside
+  saveRecording();
   cleanCall();
 }
 function returnToCall(){G('callBanner').classList.remove('on');G('callOv').classList.add('on');callMinimized=false;}
@@ -1533,11 +1507,10 @@ function minimizeCall(){G('callOv').classList.remove('on');G('callBanner').class
 function cleanCall(){
   stopRing();clearInterval(callTimer);
   isInCall=false;callSec=0;isMuted=false;isCamOff=false;
-  callType='audio'; // ← reset so next call doesn't inherit 'video'
+  callType='audio';
   const prevCallId=callId;
   callId=null;callerId=null;
   isGroupCall=false;groupCallId=null;groupMembers=[];
-  // Close all peer connections
   if(pc){pc.close();pc=null;}
   Object.values(pcs).forEach(p=>p.close());
   pcs={};
@@ -1557,7 +1530,6 @@ let _busyRetryName='',_busyRetryUid='',_busyRetryType='audio';
 let _declinedName='',_declinedUid='',_declinedType='audio';
 
 function showBusyScreen(who, name=''){
-  // who = 'you' (caller is busy) or 'them' (callee is busy)
   const icon  = who==='you' ? '📵' : '📞';
   const title = who==='you' ? 'You Are In a Call' : `${name||'User'} is Busy`;
   const sub   = who==='you' ? 'End your current call before starting a new one.'
@@ -1565,7 +1537,6 @@ function showBusyScreen(who, name=''){
   G('busyIcon').textContent  = icon;
   G('busyTitle').textContent = title;
   G('busySub').textContent   = sub;
-  // Show "Call Again" only when the OTHER person is busy
   G('busyCallBackBtn').style.display = who==='them' ? '' : 'none';
   if(who==='them' && activeChat){
     _busyRetryUid  = activeChat.user_id;
@@ -1573,7 +1544,6 @@ function showBusyScreen(who, name=''){
     _busyRetryType = callType||'audio';
   }
   G('busyOv').classList.add('on');
-  // Auto-dismiss after 5 seconds
   setTimeout(()=>G('busyOv').classList.remove('on'), 5000);
 }
 
@@ -1584,7 +1554,6 @@ function showDeclinedScreen(name){
   G('declinedTitle').textContent = 'Call Declined';
   G('declinedSub').textContent   = `${name} is not available right now.`;
   G('declinedOv').classList.add('on');
-  // Auto-dismiss after 5 seconds
   setTimeout(()=>G('declinedOv').classList.remove('on'), 5000);
 }
 
@@ -1653,7 +1622,6 @@ async function startGroupMedia(){
     joinTime=new Date().toISOString();
     showCallScr('active','Group Call',groupCallId);
     startCallTimer();
-    // Connect to all existing members
     for(const uid of groupMembers){if(uid!==ME.user_id)await setupGroupPeer(uid);}
   }catch(e){notif('❌','Error',e.message,'red');cleanCall();}
 }
@@ -1719,7 +1687,6 @@ function startCallRecording(){
 }
 
 async function saveRecording(){
-  // Capture callId NOW before cleanCall() can null it
   const cid=callId;
   const uid=ME?.user_id;
   const leaveTime=new Date().toISOString();
@@ -1727,7 +1694,6 @@ async function saveRecording(){
   const jt=joinTime;
 
   if(!callRecorder){return;}
-  // Stop recorder and wait for final chunks
   try{callRecorder.stop();}catch{}
   await new Promise(r=>setTimeout(r,600));
 
@@ -1735,7 +1701,6 @@ async function saveRecording(){
     callRecChunks=[];callRecorder=null;return;
   }
   if(!callRecChunks.length){
-    // Still save metadata-only record even with no audio chunks
     try{
       await fetch(`${SRV}/api/recording/${cid}/${uid}`,{
         method:'POST',headers:{'Content-Type':'application/json'},
@@ -1748,12 +1713,9 @@ async function saveRecording(){
   const blob=new Blob(callRecChunks,{type:'audio/webm'});
   callRecChunks=[];callRecorder=null;
 
-  // MongoDB limit is 16MB per doc. Base64 inflates by ~33%.
-  // Safe max raw blob = ~9MB → base64 ≈ 12MB, leaving room for other fields.
-  const MAX_CHUNK_BYTES = 9 * 1024 * 1024; // 9MB raw
+  const MAX_CHUNK_BYTES = 9 * 1024 * 1024;
 
   if(blob.size <= MAX_CHUNK_BYTES){
-    // Small enough — send as single doc
     try{
       const b64=await blobB64(blob);
       await fetch(`${SRV}/api/recording/${cid}/${uid}`,{
@@ -1762,7 +1724,6 @@ async function saveRecording(){
       });
     }catch(e){console.warn('Save recording failed:',e);}
   } else {
-    // Too large — split into ≤9MB chunks and send each separately
     const totalChunks=Math.ceil(blob.size/MAX_CHUNK_BYTES);
     for(let i=0;i<totalChunks;i++){
       const start=i*MAX_CHUNK_BYTES;
